@@ -95,3 +95,70 @@ def save_upload_metadata(
 
     return metadata
 
+
+# --- New: conversion integration ---
+from app.services import conversion  # uses the new file app/services/conversion.py
+from typing import Optional
+
+# audio extensions we want to convert (WhatsApp uses .opus inside ogg container sometimes)
+CONVERT_EXTS = {".opus", ".oga", ".ogg", ".mp3", ".m4a"}
+
+
+async def save_and_convert_upload(
+    upload_file: UploadFile,
+    dest_path: Path,
+    max_size: int = DEFAULT_MAX_SIZE,
+    sample_rate: int = 16000,
+) -> Dict[str, Any]:
+    """
+    High-level helper: save the uploaded file, optionally convert to WAV and
+    write metadata including converted file path + duration.
+    Returns the metadata dictionary written (same shape as save_upload_metadata return).
+    """
+    # 1) Save original file
+    size_bytes = await save_upload_file(upload_file, dest_path, max_size=max_size)
+
+    extra = {}
+    original_suffix = dest_path.suffix.lower()
+
+    # 2) If it's a convertible extension, run conversion
+    if original_suffix in CONVERT_EXTS:
+        # Create converted filename (same UUID stem + .wav)
+        converted_name = f"{dest_path.stem}.wav"
+        # create a converted directory inside uploads (e.g., uploads/converted/)
+        converted_dir = Path(UPLOAD_DIR) / "converted"
+        converted_dir.mkdir(parents=True, exist_ok=True)
+        converted_path = converted_dir / converted_name
+
+        # Run conversion (async)
+        try:
+            await conversion.convert_opus_to_wav(dest_path, converted_path, sample_rate=sample_rate)
+            duration = await conversion.get_duration_seconds(converted_path)
+            extra["converted_name"] = converted_name
+            # store relative paths (string) so JSON is simple
+            extra["converted_path"] = str(converted_path.resolve())
+            extra["duration_seconds"] = duration
+        except Exception as e:
+            # If conversion fails, include an error note in metadata but don't crash the server.
+            extra["conversion_error"] = str(e)
+
+    # 3) Save metadata (including extra if present)
+    metadata = save_upload_metadata(
+        original_name=upload_file.filename,
+        stored_name=dest_path.name,
+        mime_type=upload_file.content_type,
+        size_bytes=size_bytes,
+        extra=extra if extra else None,
+    )
+
+    # add converted fields at top-level for convenience if present
+    if extra:
+        if "converted_name" in extra:
+            metadata["converted_name"] = extra.get("converted_name")
+            metadata["converted_path"] = extra.get("converted_path")
+            metadata["duration_seconds"] = extra.get("duration_seconds")
+        if "conversion_error" in extra:
+            metadata["conversion_error"] = extra.get("conversion_error")
+
+    return metadata
+
